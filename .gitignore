@@ -1,0 +1,33 @@
+# Large Data
+**/datos/
+datos/
+modelos/*.h5
+# modelos/*.keras  # Temporarily allowing for Railway deployment
+*.pkl
+*.csv
+
+# Flutter
+**/build/
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+
+# Python
+venv/
+**/venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.vscode/
+
+# IDE
+.idea/
+*.iml
+
+# OS
+Thumbs.db
+.DS_Store

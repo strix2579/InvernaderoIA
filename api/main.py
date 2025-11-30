@@ -469,10 +469,443 @@ async def predict(data: SensorData, current_user: User = Depends(get_current_use
 
         pred_dict = {clase: float(prob) for clase, prob in zip(clases, pred_proba)}
         clase_mas_probable = max(pred_dict, key=pred_dict.get)
+    
+    raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+@app.post("/auth/google", response_model=Token)
+async def google_login(login_data: GoogleLoginRequest):
+    """Google OAuth 2.0 Login"""
+    # En producción: validar id_token con Google API
+    id_token = login_data.id_token
+    username = f"google_{id_token[:12]}"
+    
+    if username not in fake_users_db:
+        fake_users_db[username] = {
+            "username": username,
+            "full_name": "Google User",
+            "email": f"{username}@gmail.com",
+            "hashed_password": get_password_hash("Google123"),
+            "disabled": False,
+            "role": "viewer"
+        }
+    
+    access_token = create_access_token(
+        data={"sub": username, "role": "viewer"}, 
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+    refresh_token = create_refresh_token(
+        data={"sub": username, "role": "viewer"}
+    )
+    
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer"
+    }
+
+@app.get("/auth/me", response_model=User)
+async def read_users_me(current_user: User = Depends(get_current_user)):
+    """Obtener información del usuario actual"""
+    return current_user
+
+# ---- Control Endpoint ----
+
+class ControlCommandRequest(BaseModel):
+    device_id: str
+    action: str
+    value: float = None
+    timestamp: str = None
+
+@app.post("/api/control")
+async def control_device(command: ControlCommandRequest, current_user: User = Depends(get_current_user)):
+    """
+    Recibe comandos de control desde el frontend y los reenvía via WebSocket al ESP32.
+    """
+    print(f"📡 Comando recibido: {command}")
+    
+    # Mapear al formato que espera el ESP32
+    # Frontend envía: device_id='pump1', action='ON'
+    # ESP32 espera: { "type": "COMMAND", "payload": { "actuator": "pump1", "action": "ON" } }
+    
+    message = {
+        "type": "COMMAND",
+        "payload": {
+            "actuator": command.device_id,
+            "action": command.action,
+            "value": command.value
+        }
+    }
+    
+    await manager.broadcast(message)
+    return {"status": "command_sent", "command": command}
+
+# ---- WebSocket Endpoint ----
+
+@app.websocket("/ws/connect")
+async def websocket_endpoint(websocket: WebSocket, client_id: str = "unknown"):
+    await manager.connect(websocket, client_id)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            try:
+                msg_json = json.loads(data)
+                
+                if msg_json.get("type") == "TELEMETRY":
+                    payload = msg_json.get("payload")
+                    
+                    # Guardar en Base de Datos
+                    try:
+                        db = database.SessionLocal()
+                        soil_data = payload.get("soil_moisture", [0, 0])
+                        water_data = payload.get("water_level", [0, 0])
+                        gas_data = payload.get("gas", {})
+                        
+                        reading = models.SensorReading(
+                            temperature=payload.get("temp", 0),
+                            humidity=payload.get("hum", 0),
+                            soil_moisture_1=soil_data[0] if len(soil_data) > 0 else 0,
+                            soil_moisture_2=soil_data[1] if len(soil_data) > 1 else 0,
+                            water_level_1=water_data[0] if len(water_data) > 0 else 0,
+                            water_level_2=water_data[1] if len(water_data) > 1 else 0,
+                            gas_mq2=gas_data.get("mq2", 0),
+                            gas_mq5=gas_data.get("mq5", 0),
+                            gas_mq135=gas_data.get("aqi", 0)
+                        )
+                        db.add(reading)
+                        db.commit()
+                        db.close()
+                    except Exception as e:
+                        print(f"⚠️ Error guardando en DB: {e}")
+
+                    if model and scaler and payload:
+                        try:
+                            soil1 = payload.get("soil_moisture", [0, 0])[0]
+                            soil2 = payload.get("soil_moisture", [0, 0])[1] if len(payload.get("soil_moisture", [])) > 1 else 0
+                            gas_data = payload.get("gas", {})
+                            
+                            datos_array = np.array([[
+                                payload.get("temp", 0),
+                                payload.get("hum", 0),
+                                soil1,
+                                soil2,
+                                gas_data.get("mq2", 0),
+                                gas_data.get("mq5", 0),
+                                gas_data.get("mq8", 0),
+                                gas_data.get("aqi", 0)
+                            ]])
+                            
+                            datos_scaled = scaler.transform(datos_array)
+                            pred_proba = model.predict(datos_scaled, verbose=0)[0]
+                            pred_dict = {clase: float(prob) for clase, prob in zip(clases, pred_proba)}
+                            clase_predicha = max(pred_dict, key=pred_dict.get)
+                            
+                            await manager.broadcast({
+                                "type": "STATE_UPDATE",
+                                "payload": {
+                                    "sensors": payload,
+                                    "prediction": {
+                                        "class": clase_predicha,
+                                        "probabilities": pred_dict
+                                    }
+                                }
+                            })
+                            
+                            if clase_predicha == "INCENDIO" and pred_dict[clase_predicha] > 0.8:
+                                await manager.broadcast({
+                                    "type": "ALERT",
+                                    "payload": {
+                                        "type": "FIRE",
+                                        "severity": "CRITICAL",
+                                        "message": "¡Incendio detectado!",
+                                        "confidence": pred_dict[clase_predicha]
+                                    }
+                                })
+                                
+                        except Exception as e:
+                            print(f"Error en predicción: {e}")
+                
+                elif msg_json.get("type") == "COMMAND":
+                    await manager.broadcast({
+                        "type": "COMMAND",
+                        "payload": msg_json.get("payload")
+                    })
+                    
+            except json.JSONDecodeError:
+                pass
+                
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, client_id)
+
+# ---- AI Prediction Endpoint (Legacy/REST) ----
+
+@app.post("/predict/")
+async def predict(data: SensorData, current_user: User = Depends(get_current_user)):
+    """Recibe datos de los sensores y devuelve la predicción"""
+    if not model or not scaler:
+        raise HTTPException(status_code=503, detail="Modelo no disponible.")
+
+    try:
+        soil1 = data.soil_moisture[0] if len(data.soil_moisture) > 0 else 0
+        soil2 = data.soil_moisture[1] if len(data.soil_moisture) > 1 else 0
+        
+        datos_array = np.array([[
+            data.temp, 
+            data.hum, 
+            soil1, 
+            soil2, 
+            data.gas.mq2, 
+            data.gas.mq5, 
+            data.gas.mq8, 
+            data.gas.aqi
+        ]])
+
+        datos_scaled = scaler.transform(datos_array)
+        pred_proba = model.predict(datos_scaled, verbose=0)[0]
+
+        pred_dict = {clase: float(prob) for clase, prob in zip(clases, pred_proba)}
+        clase_mas_probable = max(pred_dict, key=pred_dict.get)
 
         return {"predicciones": pred_dict, "clase_predicha": clase_mas_probable}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error predicción: {str(e)}")
+
+from typing import List, Optional
+# En producción: validar id_token con Google API
+    id_token = login_data.id_token
+    username = f"google_{id_token[:12]}"
+    
+    if username not in fake_users_db:
+        fake_users_db[username] = {
+            "username": username,
+            "full_name": "Google User",
+            "email": f"{username}@gmail.com",
+            "hashed_password": get_password_hash("Google123"),
+            "disabled": False,
+            "role": "viewer"
+        }
+    
+    access_token = create_access_token(
+        data={"sub": username, "role": "viewer"}, 
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+    refresh_token = create_refresh_token(
+        data={"sub": username, "role": "viewer"}
+    )
+    
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer"
+    }
+
+@app.get("/auth/me", response_model=User)
+async def read_users_me(current_user: User = Depends(get_current_user)):
+    """Obtener información del usuario actual"""
+    return current_user
+
+# ---- Control Endpoint ----
+
+class ControlCommandRequest(BaseModel):
+    device_id: str
+    action: str
+    value: float = None
+    timestamp: str = None
+
+@app.post("/api/control")
+async def control_device(command: ControlCommandRequest, current_user: User = Depends(get_current_user)):
+    """
+    Recibe comandos de control desde el frontend y los reenvía via WebSocket al ESP32.
+    """
+    print(f"📡 Comando recibido: {command}")
+    
+    # Mapear al formato que espera el ESP32
+    # Frontend envía: device_id='pump1', action='ON'
+    # ESP32 espera: { "type": "COMMAND", "payload": { "actuator": "pump1", "action": "ON" } }
+    
+    message = {
+        "type": "COMMAND",
+        "payload": {
+            "actuator": command.device_id,
+            "action": command.action,
+            "value": command.value
+        }
+    }
+    
+    await manager.broadcast(message)
+    return {"status": "command_sent", "command": command}
+
+# ---- WebSocket Endpoint ----
+
+@app.websocket("/ws/connect")
+async def websocket_endpoint(websocket: WebSocket, client_id: str = "unknown"):
+    await manager.connect(websocket, client_id)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            try:
+                msg_json = json.loads(data)
+                
+                if msg_json.get("type") == "TELEMETRY":
+                    payload = msg_json.get("payload")
+                    
+                    # Guardar en Base de Datos
+                    try:
+                        db = database.SessionLocal()
+                        soil_data = payload.get("soil_moisture", [0, 0])
+                        water_data = payload.get("water_level", [0, 0])
+                        gas_data = payload.get("gas", {})
+                        
+                        reading = models.SensorReading(
+                            temperature=payload.get("temp", 0),
+                            humidity=payload.get("hum", 0),
+                            soil_moisture_1=soil_data[0] if len(soil_data) > 0 else 0,
+                            soil_moisture_2=soil_data[1] if len(soil_data) > 1 else 0,
+                            water_level_1=water_data[0] if len(water_data) > 0 else 0,
+                            water_level_2=water_data[1] if len(water_data) > 1 else 0,
+                            gas_mq2=gas_data.get("mq2", 0),
+                            gas_mq5=gas_data.get("mq5", 0),
+                            gas_mq135=gas_data.get("aqi", 0)
+                        )
+                        db.add(reading)
+                        db.commit()
+                        db.close()
+                    except Exception as e:
+                        print(f"⚠️ Error guardando en DB: {e}")
+
+                    if model and scaler and payload:
+                        try:
+                            soil1 = payload.get("soil_moisture", [0, 0])[0]
+                            soil2 = payload.get("soil_moisture", [0, 0])[1] if len(payload.get("soil_moisture", [])) > 1 else 0
+                            gas_data = payload.get("gas", {})
+                            
+                            datos_array = np.array([[
+                                payload.get("temp", 0),
+                                payload.get("hum", 0),
+                                soil1,
+                                soil2,
+                                gas_data.get("mq2", 0),
+                                gas_data.get("mq5", 0),
+                                gas_data.get("mq8", 0),
+                                gas_data.get("aqi", 0)
+                            ]])
+                            
+                            datos_scaled = scaler.transform(datos_array)
+                            pred_proba = model.predict(datos_scaled, verbose=0)[0]
+                            pred_dict = {clase: float(prob) for clase, prob in zip(clases, pred_proba)}
+                            clase_predicha = max(pred_dict, key=pred_dict.get)
+                            
+                            await manager.broadcast({
+                                "type": "STATE_UPDATE",
+                                "payload": {
+                                    "sensors": payload,
+                                    "prediction": {
+                                        "class": clase_predicha,
+                                        "probabilities": pred_dict
+                                    }
+                                }
+                            })
+                            
+                            if clase_predicha == "INCENDIO" and pred_dict[clase_predicha] > 0.8:
+                                await manager.broadcast({
+                                    "type": "ALERT",
+                                    "payload": {
+                                        "type": "FIRE",
+                                        "severity": "CRITICAL",
+                                        "message": "¡Incendio detectado!",
+                                        "confidence": pred_dict[clase_predicha]
+                                    }
+                                })
+                                
+                        except Exception as e:
+                            print(f"Error en predicción: {e}")
+                
+                elif msg_json.get("type") == "COMMAND":
+                    await manager.broadcast({
+                        "type": "COMMAND",
+                        "payload": msg_json.get("payload")
+                    })
+                    
+            except json.JSONDecodeError:
+                pass
+                
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, client_id)
+
+# ---- AI Prediction Endpoint (Legacy/REST) ----
+
+@app.post("/predict/")
+async def predict(data: SensorData, current_user: User = Depends(get_current_user)):
+    """Recibe datos de los sensores y devuelve la predicción"""
+    if not model or not scaler:
+        raise HTTPException(status_code=503, detail="Modelo no disponible.")
+
+    try:
+        soil1 = data.soil_moisture[0] if len(data.soil_moisture) > 0 else 0
+        soil2 = data.soil_moisture[1] if len(data.soil_moisture) > 1 else 0
+        
+        datos_array = np.array([[
+            data.temp, 
+            data.hum, 
+            soil1, 
+            soil2, 
+            data.gas.mq2, 
+            data.gas.mq5, 
+            data.gas.mq8, 
+            data.gas.aqi
+        ]])
+
+        datos_scaled = scaler.transform(datos_array)
+        pred_proba = model.predict(datos_scaled, verbose=0)[0]
+
+        pred_dict = {clase: float(prob) for clase, prob in zip(clases, pred_proba)}
+        clase_mas_probable = max(pred_dict, key=pred_dict.get)
+
+        return {"predicciones": pred_dict, "clase_predicha": clase_mas_probable}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error predicción: {str(e)}")
+
+from typing import List, Optional
+from datetime import datetime
+from .schemas import (
+    SensorData, Token, User, UserInDB, Alert, UserCreate,
+    PasswordReset, PasswordResetConfirm, SensorReadingResponse
+)
+
+@app.get("/api/history")
+def get_history(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    limit: int = 100, 
+    offset: int = 0, 
+    current_user: User = Depends(get_current_user)
+):
+    """Obtener historial de lecturas de sensores"""
+    db = database.SessionLocal()
+    try:
+        query = db.query(models.SensorReading)
+        
+        if start_date:
+            try:
+                start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+                query = query.filter(models.SensorReading.timestamp >= start_dt)
+            except ValueError:
+                pass # Ignorar formato inválido
+                
+        if end_date:
+            try:
+                end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+                query = query.filter(models.SensorReading.timestamp <= end_dt)
+            except ValueError:
+                pass
+
+        readings = query.order_by(models.SensorReading.timestamp.desc())\
+            .offset(offset)\
+            .limit(limit)\
+            .all()
+            
+        return {"data": readings}
+    finally:
+        db.close()
 
 @app.get("/")
 def root():

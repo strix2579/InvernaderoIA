@@ -85,6 +85,22 @@ class SensorData(BaseModel):
     soil_moisture: List[float] = Field(..., description="Lista de humedad del suelo (%)")
     gas: GasReadings
 
+class SensorReadingResponse(BaseModel):
+    id: int
+    timestamp: datetime
+    temperature: float
+    humidity: float
+    soil_moisture_1: float
+    soil_moisture_2: float
+    water_level_1: float
+    water_level_2: float
+    gas_mq2: float
+    gas_mq5: float
+    gas_mq135: float
+
+    class Config:
+        orm_mode = True
+
 class DeviceState(BaseModel):
     on: bool
     value: Optional[int] = None # 0-100 for speed/intensity
